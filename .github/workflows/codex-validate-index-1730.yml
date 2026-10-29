@@ -1,0 +1,125 @@
+name: Contributor validation (fork only)
+
+on:
+  push:
+    branches: [codex/validate-index-parent-1730]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.repository == 'tstotzer/markdown-vault-mcp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BASE_SHA: 339a77475086668ef896aab5a6d34bf3e8c899aa
+      EXPECTED_TREE: 37a6e76ef8ca66cc4a164be5e425ab5423fc7ee1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Apply the exact locally tested patch to its original base
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/contributor-validation"
+          base64 --decode .github/validation/index-parent-1730.patch.b64 > "$RUNNER_TEMP/contributor-validation/source.patch"
+          echo 'ec903069a187bcd39f300d7b2d8c638d848269b0ee05714341e3ce1ce5153a79  source.patch' > "$RUNNER_TEMP/contributor-validation/source.sha256"
+          (cd "$RUNNER_TEMP/contributor-validation" && sha256sum -c source.sha256)
+          git checkout --detach "$BASE_SHA"
+          git apply --check "$RUNNER_TEMP/contributor-validation/source.patch"
+          git apply "$RUNNER_TEMP/contributor-validation/source.patch"
+          git add -- README.md docs/use/storage.md docs/design/design.md src/markdown_vault_mcp/_fts_connection.py src/markdown_vault_mcp/stores/sqlite_keyword.py tests/test_index_parent_directory.py
+          git diff --cached --check
+          test "$(git write-tree)" = "$EXPECTED_TREE"
+          git diff --cached --stat
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e
+        with:
+          python-version: '3.14'
+
+      - name: Install locked dependencies
+        run: uv sync --all-extras --all-groups --locked
+
+      - name: Reproduce regression on the unchanged base
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$GITHUB_WORKSPACE"
+          base_dir="$RUNNER_TEMP/vault-base-1730"
+          git worktree add --detach "$base_dir" "$BASE_SHA"
+          cp tests/test_index_parent_directory.py "$base_dir/tests/test_index_parent_directory.py"
+          set +e
+          (cd "$base_dir" && PYTHONPATH="$base_dir/src" "$source_dir/.venv/bin/python" -m pytest tests/test_index_parent_directory.py -q) > "$RUNNER_TEMP/contributor-validation/base-regression.txt" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/contributor-validation/base-regression.txt"
+          test "$result" -eq 1
+          grep -E '5 failed, 4 passed' "$RUNNER_TEMP/contributor-validation/base-regression.txt"
+
+      - name: Run the fixed full suite with coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run pytest -x -q --cov=src/markdown_vault_mcp --cov-report=xml --cov-report=term-missing 2>&1 | tee "$RUNNER_TEMP/contributor-validation/full-suite.txt"
+          cp coverage.xml "$RUNNER_TEMP/contributor-validation/coverage.xml"
+
+      - name: Run lint, formatting and types
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run ruff check --fix .
+          uv run ruff format .
+          uv run ruff format --check .
+          uv run mypy src/ tests/
+          git diff --exit-code
+
+      - name: Install checksum-verified Vale
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/vale"
+          cd "$RUNNER_TEMP/vale"
+          curl --fail --location --retry 3 --output vale_3.14.2_Linux_64-bit.tar.gz https://github.com/vale-cli/vale/releases/download/v3.14.2/vale_3.14.2_Linux_64-bit.tar.gz
+          curl --fail --location --retry 3 --output checksums.txt https://github.com/vale-cli/vale/releases/download/v3.14.2/vale_3.14.2_checksums.txt
+          grep 'vale_3.14.2_Linux_64-bit.tar.gz$' checksums.txt | sha256sum -c -
+          tar -xzf vale_3.14.2_Linux_64-bit.tar.gz
+          echo "$RUNNER_TEMP/vale" >> "$GITHUB_PATH"
+
+      - name: Run required hooks and documentation checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          vale sync
+          uv run pre-commit install
+          uv run pre-commit run --all-files 2>&1 | tee "$RUNNER_TEMP/contributor-validation/pre-commit.txt"
+          uv run python scripts/check_docs_structure.py
+          uv run mkdocs build --strict 2>&1 | tee "$RUNNER_TEMP/contributor-validation/docs-build.txt"
+
+      - name: Create a local commit only after successful checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name tstotzer
+          git config user.email 275548156+tstotzer@users.noreply.github.com
+          test "$(git write-tree)" = "$EXPECTED_TREE"
+          git commit -m "fix(index): create missing keyword index directories" -m "Create missing parent folders when opening a writable SQLite index, independently of the optional POSIX writer lock. Preserve read-only and in-memory behavior and classify filesystem failures as unavailable. Add regression coverage for direct, backend and Vault opens." -m "Generated and tested with OpenAI Codex under the account holder's standing authorization; no per-change human review occurred." -m "Co-authored-by: OpenAI Codex <noreply@openai.com>"
+          git rev-parse HEAD > "$RUNNER_TEMP/contributor-validation/source-head.txt"
+          git diff --stat "$BASE_SHA..HEAD"
+          uv run diff-cover coverage.xml --compare-branch="$BASE_SHA" --fail-under=80 2>&1 | tee "$RUNNER_TEMP/contributor-validation/patch-coverage.txt"
+          STRUCTURAL_GATE_BASE="$BASE_SHA" bash scripts/structural_gate.sh
+          uv run --script scripts/check_template_conformance.py --rev HEAD --since "$BASE_SHA"
+          git bundle create "$RUNNER_TEMP/contributor-validation/validated-contribution.bundle" "$BASE_SHA..HEAD"
+          git status --porcelain > "$RUNNER_TEMP/contributor-validation/worktree-state.txt"
+
+      - name: Preserve validation results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: index-parent-1730-validation
+          path: ${{ runner.temp }}/contributor-validation/
+          retention-days: 1
+          if-no-files-found: error
