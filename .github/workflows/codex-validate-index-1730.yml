@@ -30,6 +30,7 @@ jobs:
           echo 'ec903069a187bcd39f300d7b2d8c638d848269b0ee05714341e3ce1ce5153a79  source.patch' > "$RUNNER_TEMP/contributor-validation/source.sha256"
           (cd "$RUNNER_TEMP/contributor-validation" && sha256sum -c source.sha256)
           git checkout --detach "$BASE_SHA"
+          git fetch --tags https://github.com/pvliesdonk/markdown-vault-mcp.git
           git apply --check "$RUNNER_TEMP/contributor-validation/source.patch"
           git apply "$RUNNER_TEMP/contributor-validation/source.patch"
           git add -- README.md docs/use/storage.md docs/design/design.md src/markdown_vault_mcp/_fts_connection.py src/markdown_vault_mcp/stores/sqlite_keyword.py tests/test_index_parent_directory.py
