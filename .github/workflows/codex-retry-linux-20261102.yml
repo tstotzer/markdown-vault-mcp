@@ -28,6 +28,7 @@ jobs:
           set -euo pipefail
           git merge-base --is-ancestor "$SOURCE_SHA" HEAD
           test "$(git diff --name-only "$SOURCE_SHA" HEAD)" = '.github/workflows/codex-retry-linux-20261102.yml'
+          git fetch --tags https://github.com/pvliesdonk/markdown-vault-mcp.git
           git update-ref refs/remotes/origin/main "$BASE_SHA"
           git diff --check "$BASE_SHA" "$SOURCE_SHA"
           git diff --stat "$BASE_SHA" "$SOURCE_SHA"
