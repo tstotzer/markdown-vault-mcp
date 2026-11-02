@@ -1,0 +1,106 @@
+name: Contributor retry validation (fork only)
+
+on:
+  push:
+    branches: [codex/validate-vault-retry-20261102]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.repository == 'tstotzer/markdown-vault-mcp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      BASE_SHA: 938d68a55753c77536ffd6e9c6f5c1fbf581f503
+      SOURCE_SHA: 7e0f07e18923782c52d0bbe2bb807bcde913da33
+      UV_NO_SYNC: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact candidate source and comparison base
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$SOURCE_SHA" HEAD
+          test "$(git diff --name-only "$SOURCE_SHA" HEAD)" = '.github/workflows/codex-retry-linux-20261102.yml'
+          git update-ref refs/remotes/origin/main "$BASE_SHA"
+          git diff --check "$BASE_SHA" "$SOURCE_SHA"
+          git diff --stat "$BASE_SHA" "$SOURCE_SHA"
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          python-version: '3.14'
+          enable-cache: false
+
+      - name: Install locked dependencies
+        run: uv sync --all-extras --all-groups --locked
+
+      - name: Reproduce both regressions on unchanged base
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_dir="$RUNNER_TEMP/vault-retry-base"
+          git worktree add --detach "$base_dir" "$BASE_SHA"
+          cp tests/test_build_index_retries.py "$base_dir/tests/test_build_index_retries.py"
+          set +e
+          (cd "$base_dir" && PYTHONPATH="$base_dir/src" "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest tests/test_build_index_retries.py -q) > "$RUNNER_TEMP/base-regression.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/base-regression.log"
+          test "$result" -eq 1
+          grep -F '2 failed' "$RUNNER_TEMP/base-regression.log"
+          grep -F 'assert (0, 0, 0, 2) == (0, 1, 0, 1)' "$RUNNER_TEMP/base-regression.log"
+
+      - name: Run complete fixed suite with coverage
+        run: uv run --no-sync --no-build pytest -x -q --cov=src/markdown_vault_mcp --cov-report=xml --cov-report=term
+
+      - name: Run lint, format, types and patch gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run ruff check --fix .
+          uv run ruff format .
+          uv run ruff format --check .
+          uv run mypy src/ tests/
+          uv run diff-cover coverage.xml --compare-branch="$BASE_SHA" --fail-under=80
+          STRUCTURAL_GATE_BASE="$BASE_SHA" bash scripts/structural_gate.sh
+          git diff --exit-code
+
+      - name: Install checksum-verified Vale
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/vale"
+          cd "$RUNNER_TEMP/vale"
+          curl --fail --location --retry 3 --output vale.tar.gz https://github.com/vale-cli/vale/releases/download/v3.14.2/vale_3.14.2_Linux_64-bit.tar.gz
+          echo '469cf88ec58a374dca14b2564c4391d2c9a1c632210aa0b642758b794082e05f  vale.tar.gz' | sha256sum -c -
+          tar -xzf vale.tar.gz vale
+          echo "$RUNNER_TEMP/vale" >> "$GITHUB_PATH"
+
+      - name: Required hooks, template and docs
+        shell: bash
+        run: |
+          set -euo pipefail
+          vale sync
+          uv run pre-commit install
+          uv run pre-commit run --all-files
+          uv run python scripts/check_template_conformance.py --rev "$SOURCE_SHA" --since "$BASE_SHA"
+          uv run python scripts/check_docs_structure.py
+          uv run mkdocs build --strict
+          git diff --exit-code
+
+      - name: Record validation provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "Validated source: $SOURCE_SHA"
+            echo "Base: $BASE_SHA"
+            echo "Harness: $(git rev-parse HEAD)"
+            echo "No upstream writes, artifacts, cache uploads, releases or deployment."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
