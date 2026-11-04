@@ -1,0 +1,76 @@
+name: Fork installed typing validation
+on:
+  push:
+    branches: [codex/validate-vault-typing-20261104]
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: github.repository == 'tstotzer/markdown-vault-mcp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      BASE_SHA: 61c898356fb328a7014610f917a511df9a3e215a
+      SOURCE_SHA: 8ac12d6512add4c3ab86ddb03698eeaaced948ea
+      UV_NO_SYNC: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify exact candidate source and base
+        run: |
+          git merge-base --is-ancestor "$SOURCE_SHA" HEAD
+          git merge-base --is-ancestor "$BASE_SHA" "$SOURCE_SHA"
+          git diff --exit-code "$SOURCE_SHA" HEAD -- ':!.github/workflows/codex-typing-linux-20261104.yml'
+          test "$(git diff --name-only "$SOURCE_SHA" HEAD | wc -l)" -eq 1
+          git fetch --tags https://github.com/pvliesdonk/markdown-vault-mcp.git
+          git update-ref refs/remotes/origin/main "$BASE_SHA"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          python-version: "3.14"
+          enable-cache: false
+      - run: uv sync --all-extras --all-groups --locked
+      - name: Demonstrate installed consumer regression on unchanged base
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/typing-base"
+          git worktree add --detach "$base" "$BASE_SHA"
+          cp tests/test_installed_typing.py "$base/tests/"
+          set +e
+          PYTHONPATH="$base/src" .venv/bin/python -m pytest "$base/tests/test_installed_typing.py" -q > "$RUNNER_TEMP/typing-base.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/typing-base.log"
+          test "$result" -eq 1
+          grep -Fq '[import-untyped]' "$RUNNER_TEMP/typing-base.log"
+      - name: Full fixed suite and coverage
+        run: uv run pytest -x -q --cov=src/markdown_vault_mcp --cov-report=xml --cov-report=term
+      - name: Lint, types and structural gates
+        run: |
+          uv run ruff check --fix .
+          uv run ruff format .
+          uv run ruff format --check .
+          uv run mypy src/ tests/
+          uv run mypy -p scripts.envelope
+          uv run diff-cover coverage.xml --compare-branch="$BASE_SHA" --fail-under=80
+          STRUCTURAL_GATE_BASE="$BASE_SHA" bash scripts/structural_gate.sh
+          git diff --exit-code
+      - name: Checksum-verified Vale
+        run: |
+          curl --fail --location --retry 2 -o "$RUNNER_TEMP/vale.tar.gz" https://github.com/vale-cli/vale/releases/download/v3.14.2/vale_3.14.2_Linux_64-bit.tar.gz
+          echo "469cf88ec58a374dca14b2564c4391d2c9a1c632210aa0b642758b794082e05f  $RUNNER_TEMP/vale.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/vale-bin"
+          tar -xzf "$RUNNER_TEMP/vale.tar.gz" -C "$RUNNER_TEMP/vale-bin" vale
+          echo "$RUNNER_TEMP/vale-bin" >> "$GITHUB_PATH"
+      - name: Complete hooks, template conformance and documentation
+        run: |
+          uv run vale sync
+          uv run pre-commit install
+          uv run pre-commit run --all-files
+          uv run python scripts/check_template_conformance.py --rev "$SOURCE_SHA" --since "$BASE_SHA"
+          uv run python scripts/check_docs_structure.py
+          uv run mkdocs build --strict
+          git diff --exit-code
+      - name: Record provenance
+        run: echo "Validated source $SOURCE_SHA against $BASE_SHA. Isolated read-only fork job; no artifact/cache uploads, releases or deployment." >> "$GITHUB_STEP_SUMMARY"
